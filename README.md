@@ -1,6 +1,6 @@
 # pm25inproxy
 
-Cache and proxy service for pm25.in AQI data service.
+[pm25.in]()空气质量数据缓存代理服务。
 
 [pm25.in]()网站为众多空气质量监测数据的使用者提供了难得的免费查询服务，首先向pm25.in
 网站的组织者和维护者表达敬意。
