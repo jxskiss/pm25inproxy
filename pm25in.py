@@ -333,7 +333,7 @@ class BrokerHandler(web.RequestHandler):
             cursor = cls.history_index.cursor()
             cursor.execute(
                 "update history set filename=? where api=? and filename=?;",
-                (join(month, fn), fn.split('?')[0], join('latest', fn)))
+                (join(month, fn), re.split('[?@]', fn)[0], join('latest', fn)))
             cls.history_index.commit()
         if count > 0:
             gen_log.info("archived %s old files" % count)
@@ -344,7 +344,7 @@ class BrokerHandler(web.RequestHandler):
                 days=config.history_kept_days)).strftime("%Y%m%d%H%M%S")
         cursor = cls.history_index.cursor()
         cursor.execute("select api, ymdh, filename from history "
-                       "where ymdh < ?;", expired)
+                       "where ymdh < ?;", (expired, ))
         old_records = cursor.fetchall()
         cls.history_index.commit()
         for rec in old_records:
@@ -355,7 +355,7 @@ class BrokerHandler(web.RequestHandler):
             else:
                 cursor.execute(
                     "delete from history where api = ? and filename = ?;",
-                    rec[0], rec[2])
+                    (rec[0], rec[2]))
                 cls.history_index.commit()
                 gen_log.info("old file %s removed" % rec[2])
             # try to remove empty directories
