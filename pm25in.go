@@ -15,6 +15,7 @@
 //     4. simple history data query support
 //     5. cached APIs data update time querying support
 //     6. compatible APIs with the python version proxy service
+//     7. gracefully shutdown on quit signal
 //
 // Changes:
 // 2016-09-24
@@ -25,6 +26,9 @@
 //     3. Improvement: remove invalid records when query history data.
 //     4. New scheduled tasks to archive history data files by month.
 //     5. Minor bug fixes.
+// 2017-01-08
+//     1. Minor improvements.
+//     2. Gracefully shutdown on quit signal.
 //
 // NOTE: the history database (bolt) is different with the database used with
 // the python version (sqlite3), also the history filename pattern is different,
@@ -44,12 +48,14 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/boltdb/bolt"
+	"github.com/braintree/manners"
 	"github.com/golang/glog"
 )
 
@@ -152,6 +158,10 @@ func fullAPIPath(basePath string) string {
 	}
 }
 
+// gracefully shutdown background goroutines
+var exitWait sync.WaitGroup
+var exitChan = make(chan int, 1)
+
 var ( // global states shared by all requests
 	historyDb   *bolt.DB
 	apiCached   = make(map[string]*CachedData)
@@ -171,6 +181,18 @@ func main() {
 	// parse command line options and flush logs before exit
 	flag.Parse()
 	defer glog.Flush()
+
+	go func() {
+		signalChan := make(chan os.Signal, 1)
+		signal.Notify(signalChan, os.Interrupt, os.Kill)
+
+		<-signalChan
+		glog.Warningln("Gracefully shutting down ...")
+		// gracefully close requests before quit background goroutines
+		manners.Close()
+		// notify background goroutines to quit
+		close(exitChan)
+	}()
 
 	var err error
 	if len(*pm25inUrl) == 0 || *port <= 0 {
@@ -223,8 +245,10 @@ func main() {
 
 	// register handlers and start serving requests
 	http.HandleFunc("/", route)
-	glog.Infoln("Starting http server, listening on port", *port)
-	glog.Fatalln(http.ListenAndServe(fmt.Sprintf(":%v", *port), nil))
+	glog.Warningln("Starting http server, listening on port", *port)
+	manners.ListenAndServe(fmt.Sprintf(":%v", *port), nil)
+	// wait for background goroutines to quit
+	exitWait.Wait()
 }
 
 func route(w http.ResponseWriter, r *http.Request) {
@@ -511,6 +535,11 @@ func getHistory(api, history string) (io.Reader, error) {
 }
 
 func schedRefresh(apis []string, sleep int) {
+	// gracefully shutdown
+	exitWait.Add(1)
+	defer exitWait.Done()
+	var refreshWait sync.WaitGroup
+
 	timeout := make(chan string, len(apis))
 	for idx, api := range apis {
 		// the variables during iteration must be copied to the inner lexical scope,
@@ -518,6 +547,9 @@ func schedRefresh(apis []string, sleep int) {
 		// see gopl "5.6.1. Caveat: Capturing Iteration Variables" for instructions.
 		idx, api := idx, api
 		go func() {
+			refreshWait.Add(1)
+			defer refreshWait.Done()
+
 			wait := 3600/CachedAPIs[api].Limit - int(
 				time.Now().Unix()-apiCached[api].GetUpdateTime())
 			// force sleeping 10 seconds between requests when startup
@@ -527,8 +559,13 @@ func schedRefresh(apis []string, sleep int) {
 			time.Sleep(time.Second * time.Duration(wait))
 			timeout <- api
 			ticker := time.Tick(time.Minute * time.Duration(60/CachedAPIs[api].Limit))
-			for range ticker {
-				timeout <- api
+			for {
+				select {
+				case <-ticker:
+					timeout <- api
+				case <-exitChan:
+					return
+				}
 			}
 		}()
 	}
@@ -542,6 +579,13 @@ func schedRefresh(apis []string, sleep int) {
 			time.Sleep(time.Second * time.Duration(sleep))
 		}
 	}()
+
+	// wait for exit signal and gracefully shutdown
+	// channel should be closed by message producer, use WaitGroup to
+	// coordinate with multiple producers
+	<-exitChan
+	refreshWait.Wait()
+	close(timeout)
 }
 
 func cleanHistory(deadline time.Time) error {
@@ -640,15 +684,25 @@ func archiveHistory() {
 }
 
 func schedHouseKeep(everyHours, keptDays int) {
+	// gracefully shutdown
+	exitWait.Add(1)
+	defer exitWait.Done()
+
 	keptHours := time.Duration(time.Hour * time.Duration(24*keptDays))
 	// do cleaning when the the program startup
 	cleanHistory(time.Now().Add(-keptHours))
 	archiveHistory()
 	// do cleaning periodically
 	ticker := time.Tick(time.Hour * time.Duration(everyHours))
-	for range ticker {
-		cleanHistory(time.Now().Add(-keptHours))
-		archiveHistory()
+
+	for {
+		select {
+		case <-ticker:
+			cleanHistory(time.Now().Add(-keptHours))
+			archiveHistory()
+		case <-exitChan:
+			return
+		}
 	}
 }
 
