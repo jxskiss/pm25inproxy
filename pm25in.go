@@ -63,6 +63,8 @@ type CachedData struct {
 	UpdateTime int64
 	DataTime   time.Time
 	Data       []byte
+
+	RefreshMut sync.Mutex
 }
 
 func (cd *CachedData) GetUpdateTime() int64 {
@@ -81,6 +83,14 @@ func (cd *CachedData) GetCachedData() []byte {
 	cd.RLock()
 	defer cd.RUnlock()
 	return cd.Data
+}
+
+func (cd *CachedData) SetNewData(updateTime int64, dataTime time.Time, data []byte) {
+	cd.Lock()
+	defer cd.Unlock()
+	cd.UpdateTime = updateTime
+	cd.DataTime = dataTime
+	cd.Data = data
 }
 
 type ProxyCount struct {
@@ -197,12 +207,7 @@ func main() {
 
 	// initialize apiCached and apiCounts global states
 	// and load cached history from database
-	cAPIs := make([]string, 0, len(CachedAPIs))
-	for api := range CachedAPIs {
-		cAPIs = append(cAPIs, api)
-		apiCached[api] = new(CachedData)
-	}
-	initHistory(cAPIs)
+	initHistory(CachedAPIs)
 	for api := range ProxyAPIs {
 		apiCounts[api] = make(map[string]*ProxyCount)
 	}
@@ -278,8 +283,8 @@ func handleCached(w http.ResponseWriter, r *http.Request) {
 func refreshCache(api string) error {
 	// lock the dataCache when refreshing, preventing other requests
 	// triggering simultaneous requests for this api to pm25.in
-	apiCached[api].Lock()
-	defer apiCached[api].Unlock()
+	apiCached[api].RefreshMut.Lock()
+	defer apiCached[api].RefreshMut.Unlock()
 
 	start := time.Now().UnixNano()
 	// one second deviation allowed
@@ -309,14 +314,15 @@ func refreshCache(api string) error {
 	}
 
 	end := time.Now().UnixNano()
-	apiCached[api].UpdateTime = end / 1e9
-	apiCached[api].Data = body
-	oldTime := apiCached[api].DataTime
-	apiCached[api].DataTime, err = parseDataTime(body)
+	updateTime := end / 1e9
+	oldDataTime := apiCached[api].DataTime
+	newDataTime, err := parseDataTime(body)
 	if err != nil {
-		apiCached[api].DataTime = time.Unix(apiCached[api].UpdateTime, 0)
+		newDataTime = time.Unix(updateTime, 0)
 	}
-	if apiCached[api].DataTime != oldTime {
+	apiCached[api].SetNewData(updateTime, newDataTime, body)
+
+	if newDataTime != oldDataTime {
 		err = saveHistory(api, end/1e9, body)
 		if err != nil {
 			glog.Errorln("failed to save history:", err)
@@ -365,9 +371,10 @@ func parseDataTime(data []byte) (time.Time, error) {
 	return time.ParseInLocation("2006-01-02T15:04:05Z", tsMostCommon, time.Local)
 }
 
-func initHistory(apis []string) {
+func initHistory(apis map[string]ApiInfo) {
 	// time.Parse uses UTC time, use ParseInLocation instead
-	for _, api := range apis {
+	for api := range apis {
+		apiCached[api] = new(CachedData)
 		historyDb.Update(func(tx *bolt.Tx) error {
 			bucket, err := tx.CreateBucketIfNotExists([]byte(api))
 			if err != nil {
@@ -513,9 +520,9 @@ func schedRefresh(apis []string, sleep int) {
 		go func() {
 			wait := 3600/CachedAPIs[api].Limit - int(
 				time.Now().Unix()-apiCached[api].GetUpdateTime())
-			// force sleeping 20 seconds between requests when startup
-			if wait < 20+idx*20 {
-				wait = 20 + idx*20
+			// force sleeping 10 seconds between requests when startup
+			if wait < 10+idx*10 {
+				wait = 10 + idx*10
 			}
 			time.Sleep(time.Second * time.Duration(wait))
 			timeout <- api
@@ -633,14 +640,14 @@ func archiveHistory() {
 }
 
 func schedHouseKeep(everyHours, keptDays int) {
-	deadline := time.Now().Add(-time.Duration(time.Hour * time.Duration(24*keptDays)))
+	keptHours := time.Duration(time.Hour * time.Duration(24*keptDays))
 	// do cleaning when the the program startup
-	cleanHistory(deadline)
+	cleanHistory(time.Now().Add(-keptHours))
 	archiveHistory()
 	// do cleaning periodically
 	ticker := time.Tick(time.Hour * time.Duration(everyHours))
 	for range ticker {
-		cleanHistory(deadline)
+		cleanHistory(time.Now().Add(-keptHours))
 		archiveHistory()
 	}
 }

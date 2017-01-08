@@ -369,7 +369,7 @@ class BrokerHandler(web.RequestHandler):
     def prepare_schedtasks(cls):
         now = time.time()
         for idx, api in enumerate(cls.sched_apis):
-            first_run = max(20 + idx * 20, (3600 / PM25IN_APIS[api].limit) - (
+            first_run = max(10 + idx * 10, (3600 / PM25IN_APIS[api].limit) - (
                 now - cls.data_cache[api]['time']))
 
             # NOTE: default value for argument api must be used to make the
